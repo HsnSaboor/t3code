@@ -2603,10 +2603,11 @@ export function makeOpenCodeAdapter(
                 },
               });
             }
-          } else if (tool === "tool" && !context.toolCompletedIds.has(event.data.id)) {
+          } else if (tool === "tool" && !alreadyCompleted) {
             // Unknown name means the start was never seen: stash the outcome
             // for the late start to converge on. A replayed terminal for an
-            // already-completed id must not re-arm the slot.
+            // already-completed id must not re-arm the slot (`alreadyCompleted`
+            // is read before this handler marks the id complete above).
             context.taskEarlyTerminalById.set(
               event.data.id,
               turnId
