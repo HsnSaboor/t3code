@@ -37,8 +37,6 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { compareSemverVersions, parseSemver } from "@t3tools/shared/semver";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
-const OPENCODE_EMPTY_CONFIG_CONTENT = "{}";
-
 export const MINIMUM_OPENCODE_VERSION = "2.0.12";
 const OPENCODE_HEALTH_TIMEOUT = "5 seconds";
 
@@ -48,11 +46,10 @@ const decodeOpenCodeInfo = Schema.decodeUnknownEffect(OpenCodeInfoSchema);
 export function resolveOpenCodeConfigContent(
   inputEnvironment: Readonly<Record<string, string | undefined>> | undefined,
   inheritedEnvironment: Readonly<Record<string, string | undefined>> = process.env,
-): string {
+): string | undefined {
   return (
     inputEnvironment?.OPENCODE_CONFIG_CONTENT ??
-    inheritedEnvironment.OPENCODE_CONFIG_CONTENT ??
-    OPENCODE_EMPTY_CONFIG_CONTENT
+    inheritedEnvironment.OPENCODE_CONFIG_CONTENT
   );
 }
 
@@ -578,6 +575,7 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
           ),
         ));
 
+      const resolvedConfigContent = resolveOpenCodeConfigContent(input.environment);
       const child = yield* spawner
         .spawn(
           ChildProcess.make(spawnCommand.command, spawnCommand.args, {
@@ -587,13 +585,14 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
               ...input.environment,
               OPENCODE_PASSWORD: serverPassword,
               // Respect an OPENCODE_CONFIG_CONTENT provided by the caller or
-              // the inherited process environment, only falling back to the
-              // empty config when neither is set. Setting it unconditionally
-              // previously clobbered the user's opencode config, hiding their
-              // providers/models. The value is set explicitly (rather than
-              // relying on inheritance) because `extendEnv` is false whenever
-              // `input.environment` is provided.
-              OPENCODE_CONFIG_CONTENT: resolveOpenCodeConfigContent(input.environment),
+              // the inherited process environment. When neither is provided,
+              // do NOT set OPENCODE_CONFIG_CONTENT so OpenCode reads the user's
+              // default configuration (~/.config/opencode/opencode.json). Setting
+              // it unconditionally to "{}" previously clobbered the user's
+              // opencode config, hiding their providers/models.
+              ...(resolvedConfigContent !== undefined
+                ? { OPENCODE_CONFIG_CONTENT: resolvedConfigContent }
+                : {}),
             },
             extendEnv: input.environment === undefined,
           }),
