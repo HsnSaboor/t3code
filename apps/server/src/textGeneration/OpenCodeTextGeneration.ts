@@ -244,7 +244,14 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
               text: input.prompt,
               files: fileParts,
             });
-            await client.session.wait({ sessionID: session.id });
+            // `session.wait` never resolves on its own when OpenCode stalls;
+            // bound it to the same 10-minute budget the v2 adapter uses for
+            // compaction so a hung request surfaces as a TextGenerationError
+            // through the prompt-request error path below.
+            await client.session.wait(
+              { sessionID: session.id },
+              { signal: AbortSignal.timeout(10 * 60_000) },
+            );
             const messages = await client.message.list({
               sessionID: session.id,
               order: "desc",

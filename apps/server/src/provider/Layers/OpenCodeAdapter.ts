@@ -316,8 +316,14 @@ function trimText(value: string | undefined | null): string | undefined {
 function openCodeEventSessionId(event: OpenCodeSubscribedEvent): string | undefined {
   const data = event.data;
   if (typeof data !== "object" || data === null) return undefined;
-  const sessionID = (data as { readonly sessionID?: unknown }).sessionID;
-  return typeof sessionID === "string" ? sessionID : undefined;
+  const payload = data as {
+    readonly sessionID?: unknown;
+    readonly form?: { readonly sessionID?: unknown };
+  };
+  // `form.created` nests the session id inside `data.form`; every other
+  // routable event carries it at `data.sessionID`.
+  if (typeof payload.sessionID === "string") return payload.sessionID;
+  return typeof payload.form?.sessionID === "string" ? payload.form.sessionID : undefined;
 }
 
 function openCodeEventSequence(
@@ -385,6 +391,8 @@ interface OpenCodeSessionContext {
   readonly toolInputsById: Map<string, Record<string, unknown>>;
   readonly taskStartedIds: Set<string>;
   readonly taskSettledIds: Set<string>;
+  /** Tool ids that already emitted `item.completed` (replays/redeliveries). */
+  readonly toolCompletedIds: Set<string>;
   readonly taskEarlyTerminalById: Map<string, { status: "completed" | "failed"; summary?: string }>;
   /** Highest durable event sequence observed for the parent session. */
   lastParentEventSequence: number;
@@ -639,19 +647,25 @@ const ensureSessionContext = Effect.fn("ensureSessionContext")(function* (
 });
 
 function normalizeOpenCodeForm(form: OpenCodeForm): ReadonlyArray<UserInputQuestion> {
-  return form.fields.map((field) => ({
-    id: field.key,
-    header: field.title ?? form.title,
-    question: field.description ?? field.title ?? field.key,
-    options:
-      "options" in field && field.options
-        ? field.options.map((option) => ({
-            label: option.label,
-            description: option.description ?? "",
-          }))
-        : [],
-    ...(field.type === "multiselect" ? { multiSelect: true } : {}),
-  }));
+  // `external` fields open a URL outside the chat and carry no value the UI
+  // could submit (`toOpenCodeQuestionAnswers` skips them), so prompting for
+  // them would block on an answer that can never arrive.
+  return form.fields
+    .filter((field) => field.type !== "external")
+    .map((field) => ({
+      id: field.key,
+      header: field.title ?? form.title,
+      question: field.description ?? field.title ?? field.key,
+      options:
+        "options" in field && field.options
+          ? field.options.map((option) => ({
+              label: option.label,
+              description: option.description ?? "",
+              value: option.value,
+            }))
+          : [],
+      ...(field.type === "multiselect" ? { multiSelect: true } : {}),
+    }));
 }
 
 const isoFromEpochMs = (value: number) =>
@@ -1048,7 +1062,7 @@ export function makeOpenCodeAdapter(
         readonly observedAt: string;
         readonly event: Record<string, unknown>;
       },
-    ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
+    ) => writeNativeEvent(threadId, event).pipe(Effect.ignoreCause);
 
     const cancelIdleReconciliation = Effect.fn("cancelIdleReconciliation")(function* (
       context: OpenCodeSessionContext,
@@ -1213,7 +1227,7 @@ export function makeOpenCodeAdapter(
           yield* Effect.sleep(`${delayMs} millis`);
         }
       }).pipe(
-        Effect.catchCause(() => Effect.void),
+        Effect.ignoreCause,
         Effect.ensuring(
           Effect.sync(() => {
             if (context.pendingIdleReconciliation === pending) {
@@ -1422,7 +1436,7 @@ export function makeOpenCodeAdapter(
         }
         yield* failPromptAdmissionRecovery(context, promptAdmission);
       }).pipe(
-        Effect.catchCause(() => Effect.void),
+        Effect.ignoreCause,
         Effect.ensuring(
           Effect.sync(() => {
             delete promptAdmission.recoveryFiber;
@@ -1578,7 +1592,7 @@ export function makeOpenCodeAdapter(
           }),
           Effect.catchIf(
             (cause) => isOpenCodeNotFound(cause),
-            () => Effect.succeed(undefined),
+            () => Effect.void,
           ),
         );
       let sessionId: string | undefined = candidateSessionId;
@@ -1932,7 +1946,7 @@ export function makeOpenCodeAdapter(
           yield* Effect.sleep(`${delayMs} millis`);
         }
       }).pipe(
-        Effect.catchCause(() => Effect.void),
+        Effect.ignoreCause,
         Effect.ensuring(
           Effect.sync(() => {
             if (context.requestRelationRetries.get(requestId) === retry) {
@@ -2061,7 +2075,7 @@ export function makeOpenCodeAdapter(
           return;
         }
       }).pipe(
-        Effect.catchCause(() => Effect.void),
+        Effect.ignoreCause,
         Effect.ensuring(
           Effect.sync(() => {
             if (context.pendingRequestRecovery === recovery) {
@@ -2330,6 +2344,68 @@ export function makeOpenCodeAdapter(
         case "session.tool.input.started": {
           context.toolNamesById.set(event.data.id, event.data.name);
           if (turnId) {
+            // The terminal event can arrive before the start (out-of-order
+            // delivery) or the start can be redelivered after the terminal.
+            // A redelivered start must not reopen a row the terminal already
+            // closed; an out-of-order start for an ordinary tool converges on
+            // the completion the terminal already emitted. Subagent tools
+            // keep the pinned reconcile path below so the task pair closes.
+            const earlyTerminal = context.taskEarlyTerminalById.get(event.data.id);
+            if (earlyTerminal !== undefined) {
+              context.taskEarlyTerminalById.delete(event.data.id);
+              if (isSubagentToolName(event.data.name)) {
+                yield* emit({
+                  ...(yield* buildEventBase({
+                    threadId: context.session.threadId,
+                    turnId,
+                    itemId: event.data.id,
+                    createdAt: isoFromEpochMs(event.created),
+                    raw: event,
+                  })),
+                  type: "item.started",
+                  payload: {
+                    itemType: toToolLifecycleItemType(event.data.name),
+                    status: "inProgress",
+                    title: event.data.name,
+                  },
+                });
+                if (!context.taskSettledIds.has(event.data.id)) {
+                  yield* emitTaskStarted(
+                    context,
+                    turnId,
+                    event.data.id,
+                    "task",
+                    undefined,
+                    event.created,
+                    event,
+                  );
+                  yield* emit({
+                    ...(yield* buildEventBase({
+                      threadId: context.session.threadId,
+                      turnId,
+                      createdAt: isoFromEpochMs(event.created),
+                      raw: event,
+                    })),
+                    type: "task.completed",
+                    payload: {
+                      taskId: RuntimeTaskId.make(event.data.id),
+                      status: earlyTerminal.status,
+                      ...(earlyTerminal.summary ? { summary: earlyTerminal.summary } : {}),
+                      timelineBypass: true,
+                    },
+                  });
+                  context.taskStartedIds.delete(event.data.id);
+                  context.taskSettledIds.add(event.data.id);
+                }
+              }
+              break;
+            }
+            if (
+              context.toolCompletedIds.has(event.data.id) ||
+              context.taskSettledIds.has(event.data.id)
+            ) {
+              break;
+            }
             yield* emit({
               ...(yield* buildEventBase({
                 threadId: context.session.threadId,
@@ -2346,39 +2422,7 @@ export function makeOpenCodeAdapter(
               },
             });
             if (isSubagentToolName(event.data.name)) {
-              if (context.taskSettledIds.has(event.data.id)) {
-                return;
-              }
-              const earlyTerminal = context.taskEarlyTerminalById.get(event.data.id);
-              if (earlyTerminal !== undefined) {
-                context.taskEarlyTerminalById.delete(event.data.id);
-                yield* emitTaskStarted(
-                  context,
-                  turnId,
-                  event.data.id,
-                  "task",
-                  undefined,
-                  event.created,
-                  event,
-                );
-                yield* emit({
-                  ...(yield* buildEventBase({
-                    threadId: context.session.threadId,
-                    turnId,
-                    createdAt: isoFromEpochMs(event.created),
-                    raw: event,
-                  })),
-                  type: "task.completed",
-                  payload: {
-                    taskId: RuntimeTaskId.make(event.data.id),
-                    status: earlyTerminal.status,
-                    ...(earlyTerminal.summary ? { summary: earlyTerminal.summary } : {}),
-                    timelineBypass: true,
-                  },
-                });
-                context.taskStartedIds.delete(event.data.id);
-                context.taskSettledIds.add(event.data.id);
-              } else if (context.taskStartedIds.has(event.data.id)) {
+              if (context.taskStartedIds.has(event.data.id)) {
                 return;
               } else {
                 yield* emitTaskStarted(
@@ -2467,7 +2511,10 @@ export function makeOpenCodeAdapter(
                   .join("\n");
           const terminalStatus = event.type === "session.tool.failed" ? "failed" : "completed";
           const terminalSummary = detail.trim() ? detail.trim().slice(0, 2000) : undefined;
-          if (turnId) {
+          // Replays and redeliveries resend the terminal event for an id that
+          // already completed; emitting again would fork the work-log timeline.
+          const alreadyCompleted = context.toolCompletedIds.has(event.data.id);
+          if (turnId && !alreadyCompleted) {
             const itemType = toToolLifecycleItemType(tool);
             yield* emit({
               ...(yield* buildEventBase({
@@ -2495,6 +2542,7 @@ export function makeOpenCodeAdapter(
               },
             });
           }
+          context.toolCompletedIds.add(event.data.id);
           if (context.taskSettledIds.has(event.data.id)) {
             break;
           }
@@ -2920,6 +2968,7 @@ export function makeOpenCodeAdapter(
           relatedSessionIds: new Set([started.openCodeSession.id]),
           taskStartedIds: new Set(),
           taskSettledIds: new Set(),
+          toolCompletedIds: new Set(),
           taskEarlyTerminalById: new Map(),
           resolvedRequestIds: new Set(),
           autoRepliedRequestIds: new Set(),
@@ -3873,6 +3922,7 @@ export function makeOpenCodeAdapter(
           context.toolInputsById.clear();
           context.taskStartedIds.clear();
           context.taskSettledIds.clear();
+          context.toolCompletedIds.clear();
           context.taskEarlyTerminalById.clear();
           context.lastParentEventSequence = 0;
           context.turnTokenUsage = undefined;

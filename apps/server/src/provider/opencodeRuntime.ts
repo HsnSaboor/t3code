@@ -252,7 +252,12 @@ export interface OpenCodeRuntimeShape {
 }
 
 function parseServerUrlFromOutput(output: string): string | null {
-  for (const line of output.split("\n").slice(0, -1)) {
+  // The readiness line may arrive without a trailing newline when it is the
+  // last chunk flushed before the caller inspects the buffer; dropping the
+  // final fragment then stalls startup until the 30s timeout. Only the
+  // fragment after the last newline can be incomplete, so parse every line
+  // and let a partial tail simply fail to match.
+  for (const line of output.split("\n")) {
     if (!line.startsWith(OPENCODE_SERVER_READY_PREFIX)) {
       continue;
     }
@@ -402,8 +407,12 @@ export function toOpenCodeQuestionAnswers(
     const values = Array.isArray(raw) ? raw : raw === undefined ? [] : [raw];
     if (values.length === 0 && !field.required) continue;
     const options = "options" in field ? field.options : undefined;
+    // Match the UI's submitted identifier: `normalizeOpenCodeForm` round-trips
+    // the native option `value` through `UserInputQuestionOption.value`, and
+    // the web client submits that value (`option.value ?? option.label`).
+    // Labels are only a display fallback for answers authored by hand.
     const value = (item: unknown) =>
-      options?.find((option) => option.label === item)?.value ?? item;
+      options?.find((option) => option.value === item || option.label === item)?.value ?? item;
     const first = value(values[0]);
     if (field.type === "multiselect")
       result[field.key] = values
