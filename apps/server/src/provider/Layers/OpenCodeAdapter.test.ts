@@ -5311,14 +5311,14 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         created: 3,
         type: "session.tool.failed",
         durable: { aggregateID: sessionID, seq: 3, version: 2 },
-        data: { ...base, executed: true, error: { message: "subagent crashed" } },
+        data: { ...base, executed: true, error: { type: "error", message: "subagent crashed" } },
       } satisfies OpenCodeEvent);
       events[3]!.resolve({
         id: "duplicate-terminal",
         created: 4,
         type: "session.tool.success",
         durable: { aggregateID: sessionID, seq: 4, version: 2 },
-        data: { ...base, executed: true, content: [] },
+        data: { ...base, executed: true, content: [{ type: "text", text: "done" }] },
       } satisfies OpenCodeEvent);
       const received = yield* Fiber.join(collected);
       const tasks = received.filter((event) => event.type.startsWith("task."));
@@ -5368,7 +5368,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         created: 1,
         type: "session.tool.failed",
         durable: { aggregateID: sessionID, seq: 1, version: 2 },
-        data: { ...base, executed: true, error: { message: "boom" } },
+        data: { ...base, executed: true, error: { type: "error", message: "boom" } },
       } satisfies OpenCodeEvent);
       events[1]!.resolve({
         id: "late-fail-start",
