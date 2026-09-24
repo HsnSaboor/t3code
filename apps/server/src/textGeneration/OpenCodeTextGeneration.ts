@@ -256,7 +256,13 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
             } catch (cause) {
               if (waitSignal.aborted) {
                 try {
-                  await client.session.interrupt({ sessionID: session.id });
+                  // Bound the cleanup too: a hung interrupt must not hold the
+                  // timed-out request open. The original wait error below is
+                  // what the caller must see either way.
+                  await client.session.interrupt(
+                    { sessionID: session.id },
+                    { signal: AbortSignal.timeout(30_000) },
+                  );
                 } catch {
                   // Best effort: the session may already be gone. The original
                   // timeout error below is what the caller must see.
