@@ -270,10 +270,15 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
               }
               throw cause;
             }
-            const messages = await client.message.list({
-              sessionID: session.id,
-              order: "desc",
-            });
+            const messages = await client.message.list(
+              {
+                sessionID: session.id,
+                order: "desc",
+              },
+              // Same overall budget as the wait above: a hung history fetch
+              // must not leave the generation pending indefinitely.
+              { signal: waitSignal },
+            );
             return messages.data.find((message) => message.type === "assistant");
           },
           catch: (cause) =>
