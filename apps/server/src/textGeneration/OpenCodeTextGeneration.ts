@@ -247,11 +247,23 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
             // `session.wait` never resolves on its own when OpenCode stalls;
             // bound it to the same 10-minute budget the v2 adapter uses for
             // compaction so a hung request surfaces as a TextGenerationError
-            // through the prompt-request error path below.
-            await client.session.wait(
-              { sessionID: session.id },
-              { signal: AbortSignal.timeout(10 * 60_000) },
-            );
+            // through the prompt-request error path below. Aborting only ends
+            // the HTTP wait — interrupt the session so OpenCode does not keep
+            // generating (and billing) after we have given up on it.
+            const waitSignal = AbortSignal.timeout(10 * 60_000);
+            try {
+              await client.session.wait({ sessionID: session.id }, { signal: waitSignal });
+            } catch (cause) {
+              if (waitSignal.aborted) {
+                try {
+                  await client.session.interrupt({ sessionID: session.id });
+                } catch {
+                  // Best effort: the session may already be gone. The original
+                  // timeout error below is what the caller must see.
+                }
+              }
+              throw cause;
+            }
             const messages = await client.message.list({
               sessionID: session.id,
               order: "desc",

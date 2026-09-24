@@ -251,18 +251,32 @@ export interface OpenCodeRuntimeShape {
   ) => Effect.Effect<ReadonlyArray<SkillInfo>, OpenCodeRuntimeError>;
 }
 
-function parseServerUrlFromOutput(output: string): string | null {
-  // The readiness line may arrive without a trailing newline when it is the
-  // last chunk flushed before the caller inspects the buffer; dropping the
-  // final fragment then stalls startup until the 30s timeout. Only the
-  // fragment after the last newline can be incomplete, so parse every line
-  // and let a partial tail simply fail to match.
-  for (const line of output.split("\n")) {
+function parseServerUrlFromOutput(output: string): {
+  readonly url: string;
+  /** Whether the readiness line was newline-terminated (definitely complete). */
+  readonly terminated: boolean;
+} | null {
+  // Every line except the last is newline-terminated and therefore complete.
+  // The trailing fragment may be a complete readiness line that never got a
+  // newline, or a partial chunk of a line still in flight — the caller keeps
+  // a trailing candidate pending until the output settles instead of
+  // resolving with a truncated URL.
+  const lines = output.split("\n");
+  for (const line of lines.slice(0, -1)) {
     if (!line.startsWith(OPENCODE_SERVER_READY_PREFIX)) {
       continue;
     }
     const match = line.match(/on\s+(https?:\/\/[^\s]+)/);
-    return match?.[1] ?? null;
+    if (match?.[1]) {
+      return { url: match[1], terminated: true };
+    }
+  }
+  const trailing = lines[lines.length - 1] ?? "";
+  if (trailing.startsWith(OPENCODE_SERVER_READY_PREFIX)) {
+    const match = trailing.match(/on\s+(https?:\/\/[^\s]+)/);
+    if (match?.[1]) {
+      return { url: match[1], terminated: false };
+    }
   }
   return null;
 }
@@ -410,9 +424,13 @@ export function toOpenCodeQuestionAnswers(
     // Match the UI's submitted identifier: `normalizeOpenCodeForm` round-trips
     // the native option `value` through `UserInputQuestionOption.value`, and
     // the web client submits that value (`option.value ?? option.label`).
-    // Labels are only a display fallback for answers authored by hand.
+    // Values win over labels across the whole option list so a duplicate
+    // label can never shadow another option's native value; labels remain a
+    // display fallback for answers authored by hand.
     const value = (item: unknown) =>
-      options?.find((option) => option.value === item || option.label === item)?.value ?? item;
+      options?.find((option) => option.value === item)?.value ??
+      options?.find((option) => option.label === item)?.value ??
+      item;
     const first = value(values[0]);
     if (field.type === "multiselect")
       result[field.key] = values
@@ -627,9 +645,42 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
           ] as const;
         }).pipe(
           Effect.flatMap((parsed) =>
-            parsed ? Deferred.succeed(readyDeferred, parsed).pipe(Effect.ignore) : Effect.void,
+            parsed === null
+              ? Effect.void
+              : parsed.terminated
+                ? Deferred.succeed(readyDeferred, parsed.url).pipe(Effect.ignore)
+                : confirmSettledReadyUrl(parsed.url).pipe(Effect.ignore),
           ),
         );
+
+      // An unterminated readiness candidate may be a partial chunk of a line
+      // still in flight. Give the output a moment to settle: if it grows,
+      // re-parse (the next chunk's handler also runs, so this just avoids
+      // resolving with a truncated URL when no further chunk ever arrives).
+      const confirmSettledReadyUrl = (candidate: string): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          if (yield* Deferred.isDone(readyDeferred)) {
+            return;
+          }
+          const before = yield* Ref.get(stdoutRef);
+          yield* Effect.sleep("300 millis");
+          if (yield* Deferred.isDone(readyDeferred)) {
+            return;
+          }
+          const after = yield* Ref.get(stdoutRef);
+          if (after === null || after === before) {
+            yield* Deferred.succeed(readyDeferred, candidate).pipe(Effect.ignore);
+            return;
+          }
+          const reparsed = parseServerUrlFromOutput(after);
+          if (reparsed === null) {
+            yield* Deferred.succeed(readyDeferred, candidate).pipe(Effect.ignore);
+          } else if (reparsed.terminated) {
+            yield* Deferred.succeed(readyDeferred, reparsed.url).pipe(Effect.ignore);
+          } else {
+            yield* confirmSettledReadyUrl(reparsed.url);
+          }
+        });
 
       const stdoutFiber = yield* child.stdout.pipe(
         Stream.decodeText(),
